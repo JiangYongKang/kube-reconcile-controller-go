@@ -99,3 +99,43 @@ func TestLeaseRelease(t *testing.T) {
 	}
 	t.Logf("释放规则验证通过: 仅持有者可释放，释放后他人可获取")
 }
+
+// TestValidateFencingToken 持有权标识复核：版本与持有者任一变化即失效。
+func TestValidateFencingToken(t *testing.T) {
+	clk := NewFakeClock(time.Now())
+	lm := NewManager(time.Minute)
+	lm.SetClock(clk)
+
+	rec, err := lm.Acquire("shard-0", "inst-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !lm.Validate("shard-0", "inst-1", rec.Version) {
+		t.Fatal("当前持有者的有效令牌应通过复核")
+	}
+	t.Logf("holder=inst-1 version=%d 复核=有效", rec.Version)
+
+	// 换主：inst-1 失联过期，inst-2 接管，旧令牌必须失效。
+	clk.Advance(2 * time.Minute)
+	rec2, err := lm.Acquire("shard-0", "inst-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lm.Validate("shard-0", "inst-1", rec.Version) {
+		t.Fatal("换主后旧实例的旧令牌应失效")
+	}
+	if lm.Validate("shard-0", "inst-2", rec.Version) {
+		t.Fatal("新持有者持旧版本号也应失效")
+	}
+	if !lm.Validate("shard-0", "inst-2", rec2.Version) {
+		t.Fatal("新持有者的新令牌应有效")
+	}
+	t.Logf("换主后 holder=inst-2 version=%d；旧令牌(inst-1,v%d)复核=失效", rec2.Version, rec.Version)
+
+	// 租约自然过期后复核同样失效。
+	clk.Advance(2 * time.Minute)
+	if lm.Validate("shard-0", "inst-2", rec2.Version) {
+		t.Fatal("租约过期后令牌应失效")
+	}
+	t.Logf("判定=持有权标识（holder+version+未过期）复核规则正确")
+}

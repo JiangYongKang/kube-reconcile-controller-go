@@ -108,6 +108,16 @@ func (m *Manager) HeldBy(shard, holder string) bool {
 	return ok && cur.Holder == holder && m.clock.Now().Before(cur.ExpiresAt)
 }
 
+// Validate 校验持有权标识（shard, holder, version）在当前是否仍然有效：
+// 租约仍由 holder 持有、版本一致且未过期。用于生效动作发出前的围栏复核，
+// 换主（holder 或 version 变化）后旧实例的迟到动作会被判为无效。
+func (m *Manager) Validate(shard, holder string, version int64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.leases[shard]
+	return ok && cur.Holder == holder && cur.Version == version && m.clock.Now().Before(cur.ExpiresAt)
+}
+
 // Release 主动释放租约（仅持有者可释放）。
 func (m *Manager) Release(shard, holder string) {
 	m.mu.Lock()

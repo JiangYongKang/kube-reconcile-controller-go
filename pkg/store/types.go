@@ -46,12 +46,12 @@ func IsConflict(err error) (ConflictReason, bool) {
 
 // Object 是存储中的对象，携带资源版本。
 type Object struct {
-	Key            string
+	Key             string
 	ResourceVersion int64
-	Generation     int64
-	Data           map[string]string
-	Status         map[string]string
-	UpdatedAt      time.Time
+	Generation      int64
+	Data            map[string]string
+	Status          map[string]string
+	UpdatedAt       time.Time
 }
 
 // DeepCopy 返回对象的深拷贝，避免外部修改存储内部状态。

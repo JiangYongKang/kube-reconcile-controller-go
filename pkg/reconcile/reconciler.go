@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/highcumontoa/kube-reconcile-controller-go/pkg/effect"
 	"github.com/highcumontoa/kube-reconcile-controller-go/pkg/lease"
 	"github.com/highcumontoa/kube-reconcile-controller-go/pkg/store"
 )
@@ -100,12 +101,16 @@ func (q *Queue) Close() {
 // Controller 是协调控制器：从队列取对象，在持有分片租约的前提下
 // 调用 Handler 并乐观并发回写状态。
 type Controller struct {
-	Store     *store.MemoryStore
-	Leases    *lease.Manager
-	Handler   Handler
-	Queue     *Queue
-	Instance  string // 实例 ID，用于租约持有
-	Logger    *log.Logger
+	Store   *store.MemoryStore
+	Leases  *lease.Manager
+	Handler Handler
+	Queue   *Queue
+	// Journal 与 Sink 启用对外副作用的恰好一次生效；
+	// 均为 nil 时退化为旧的纯状态写回行为（向后兼容）。
+	Journal  *effect.Journal
+	Sink     effect.Sink
+	Instance string // 实例 ID，用于租约持有
+	Logger   *log.Logger
 }
 
 // NewController 创建控制器。
@@ -126,14 +131,19 @@ func NewController(instance string, st *store.MemoryStore, lm *lease.Manager, h 
 // 重复投递/重放不会产生新的版本或重复副作用。
 func (c *Controller) ReconcileOne(ctx context.Context, shard, key string) (requeue bool, err error) {
 	// 1. 租约检查：未持有则尝试获取/接管；被他人持有则稍后重试。
+	//    租约版本即生效动作的持有权标识（围栏令牌）。
+	var leaseRec lease.Record
 	if !c.Leases.HeldBy(shard, c.Instance) {
 		rec, aerr := c.Leases.Acquire(shard, c.Instance)
 		if aerr != nil {
 			c.logf("key=%s shard=%s 判定=租约被他人持有 依据=%v -> 稍后重试", key, shard, aerr)
 			return true, nil
 		}
+		leaseRec = *rec
 		c.logf("key=%s shard=%s 判定=获得租约 holder=%s leaseVersion=%d expiresAt=%s",
 			key, shard, rec.Holder, rec.Version, rec.ExpiresAt.Format("15:04:05.000"))
+	} else if snap, ok := c.Leases.Snapshot(shard); ok {
+		leaseRec = snap
 	}
 
 	// 2. 读取对象当前版本。
@@ -156,6 +166,39 @@ func (c *Controller) ReconcileOne(ctx context.Context, shard, key string) (reque
 	if desired == nil || equalMap(desired, obj.Status) {
 		c.logf("key=%s shard=%s rv=%d 判定=已达目标状态 -> 幂等跳过写回", key, shard, obj.ResourceVersion)
 		return false, nil
+	}
+
+	// 3.5 对外副作用的恰好一次生效（启用 Journal+Sink 时）。
+	// 判定依据：目标状态指纹（去重）、租约版本（围栏令牌）、对象 rv。
+	if c.Journal != nil && c.Sink != nil {
+		fp := effect.FingerprintOf(desired)
+		if last := c.Journal.LatestFingerprint(key); last == fp {
+			c.logf("key=%s shard=%s rv=%d 判定=目标状态未变更 指纹=%s -> 跳过生效仅写回状态",
+				key, shard, obj.ResourceVersion, fp)
+		} else {
+			rec := effect.Record{
+				ID:           effect.IDFor(key, fp),
+				Key:          key,
+				Shard:        shard,
+				Fingerprint:  fp,
+				Holder:       c.Instance,
+				FencingToken: leaseRec.Version,
+				ObjectRV:     obj.ResourceVersion,
+			}
+			res := c.Journal.Execute(ctx, rec, desired, c.Sink, func() bool {
+				return c.Leases.Validate(shard, c.Instance, leaseRec.Version)
+			})
+			c.logf("key=%s shard=%s rv=%d 生效判定=%s 依据=%s（指纹=%s holder=%s token=%d objRV=%d）",
+				key, shard, obj.ResourceVersion, res.Decision, res.Reason,
+				rec.Fingerprint, rec.Holder, rec.FencingToken, rec.ObjectRV)
+			switch {
+			case res.Decision == effect.DecisionRejectedStaleFencing:
+				// 分片已被接管：本实例的生效被判过期，放弃，由新持有者收敛。
+				return false, nil
+			case res.Err != nil:
+				return true, res.Err
+			}
+		}
 	}
 
 	// 4. 乐观并发回写：携带读取时的 rv，冲突则重读重试，不丢更新。

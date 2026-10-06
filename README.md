@@ -8,6 +8,7 @@
 ```
 pkg/store      本地对象存储：资源版本 + 乐观并发控制
 pkg/lease      分片租约：多实例互斥协调与故障接管
+pkg/effect     生效日志：对外副作用的持久化去重 + 围栏判定
 pkg/reconcile  协调控制器：去重队列 + 幂等可重入协调循环
 cmd/controller 本地运行示例
 ```
@@ -48,6 +49,50 @@ cmd/controller 本地运行示例
 - 持有者失联（停止续租）后，租约随 TTL 过期，其他实例可接管；
   接管结果（新 holder、leaseVersion）与冲突原因在日志中可区分。
 - 仅持有者可 `Release`；测试可用 `FakeClock` 手动推进时间模拟过期。
+- `Validate(shard, holder, version)` 复核持有权标识：holder、version 任一
+  变化（换主）或租约过期后即失效，供生效动作发出前做围栏复核。
+
+## 生效恰好一次（pkg/effect）
+
+控制器启用 `Journal` + `Sink` 后，对外副作用（下单、发通知等）按
+**恰好一次** 语义生效；两者为 nil 时退化为旧的纯状态写回行为（向后兼容）。
+
+### 去重判据
+
+- **生效 ID（幂等键）** = `对象key@目标状态指纹`。指纹由期望状态剔除
+  抖动字段（`_` 前缀的键，如时间戳）后做确定性哈希得到，字段顺序无关。
+- 生效记录持久化在 `Journal` 中（与 Store/Lease 一样独立于控制器进程），
+  因此**进程重启后重放**依然能识别「这次生效已发生过」：
+  - 同 ID 记录已 `Completed` → `SkippedDuplicate`，直接跳过；
+  - 同 ID 记录停留在 `InFlight`（崩溃卡在「动作已发出、完成未记录」
+    的中间态）→ **明确规则：用同一幂等键重放，由外部系统按幂等键去重**，
+    判定为 `RecoveredInFlight`，绝不静默重复，也不静默丢失；
+  - 无记录 → 认领为 `InFlight` 后触发，成功才落 `Completed`。
+- `Sink`（外部系统）必须按 `Effect.ID` 幂等，这是崩溃窗口规则成立的前提。
+
+### 换主时的过期判定（围栏）
+
+- 租约版本即**持有权标识（围栏令牌）**，每次生效都携带
+  `(对象版本 rv, 当前持有者 holder, 令牌 token)`，判定结果与依据逐条进日志。
+- 双层拦截旧实例的迟到动作：
+  1. `Journal` 按分片维护令牌**单调高水位**，低于水位的生效请求判为
+     `RejectedStaleFencing`（即使其生效 ID 从未出现、去重拦不住）；
+  2. 触发外部动作前用 `lease.Validate` 复核持有权，换主后立即失效。
+- 被拒的生效直接丢弃（不重试），由新持有者收敛，任意时刻只有一个
+  实例真正生效。
+
+### 何时允许再次生效
+
+- 目标状态**实质变更**（指纹变化）→ 生成新生效 ID，允许再生效一次；
+- 仅抖动字段变化或完全重放（指纹不变）→ 跳过生效，仅按需写回状态；
+- 两种情况在日志中可明确区分（`Executed` / `SkippedDuplicate` /
+  `目标状态未变更` / `RejectedStaleFencing` / `RecoveredInFlight`）。
+
+### 兼容范围
+
+- 不设置 `Journal`/`Sink` 时控制器行为与上一版完全一致，既有用例不变；
+- 对象存储、租约的语义未变，仅 `lease.Manager` 新增 `Validate` 方法；
+- 生效去重不依赖对象 Status 中的额外字段，判据全部在 `Journal` 中。
 
 ## 本地验证
 
@@ -70,3 +115,13 @@ go run ./cmd/controller
 | `TestInterruptedReconcileConverges` | 协调中断无部分写回，重启重放收敛到同一状态 |
 | `TestLeaseTakeoverBetweenControllers` | 双实例互斥生效与过期接管，无双主 |
 | `TestConcurrentReconcileNoLostUpdate` | 控制器回写与外部写入并发，双方更新均不丢失 |
+| `TestDuplicateDeliverySkipped` / `TestConcurrentExecuteExactlyOnce` | 生效日志去重：重复请求、16 实例并发均恰好生效一次 |
+| `TestCrashWindowRecovery` | 崩溃窗口（动作已发出、完成未记录）按同一幂等键恢复，不静默重复 |
+| `TestStaleFencingRejected` / `TestFencingValidCallback` | 围栏高水位与持有权复核拦截旧实例迟到动作 |
+| `TestChangedFingerprintReexecutes` / `TestFingerprintIgnoresVolatileFields` | 实质变更再次生效、抖动字段豁免、未变更不重复 |
+| `TestValidateFencingToken` | 持有权标识（holder+version+未过期）复核规则 |
+| `TestEffectExactlyOnceRedelivery` / `TestEffectRestartReplayNoDuplicate` | 控制器级：重复投递、重启重放均恰好生效一次 |
+| `TestEffectCrashWindowResume` | 控制器级：崩溃窗口续跑，幂等键去重后恰好一次 |
+| `TestEffectConcurrentInstances` | 4 实例并发抢占同一对象，恰好生效一次 |
+| `TestStaleInstanceEffectRejected` | 故障接管后旧实例迟到的生效被判过期拒绝，未覆盖新实例结果 |
+| `TestEffectDesiredChangeReexecutes` | 目标状态实质变更再次生效、未变更重放不重复 |
