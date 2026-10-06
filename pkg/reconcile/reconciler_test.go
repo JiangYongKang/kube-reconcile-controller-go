@@ -82,7 +82,7 @@ func TestIdempotentRedelivery(t *testing.T) {
 
 // flakyHandler 前 failTimes 次调用失败，模拟协调中途失败/进程崩溃。
 type flakyHandler struct {
-	inner    *applyHandler
+	inner     *applyHandler
 	failTimes int
 	calls     atomic.Int64
 }

@@ -23,7 +23,7 @@ func TestUpdateConflictReasons(t *testing.T) {
 	t.Logf("缺失版本写入被拒绝: reason=%s 判定依据=%v", reason, err)
 
 	// 版本陈旧
-	stale := obj.DeepCopy() // rv=1
+	stale := obj.DeepCopy()                             // rv=1
 	if _, err := s.Update(obj.DeepCopy()); err != nil { // rv 1 -> 2
 		t.Fatalf("first update: %v", err)
 	}

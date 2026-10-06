@@ -100,12 +100,17 @@ func (q *Queue) Close() {
 // Controller 是协调控制器：从队列取对象，在持有分片租约的前提下
 // 调用 Handler 并乐观并发回写状态。
 type Controller struct {
-	Store     *store.MemoryStore
-	Leases    *lease.Manager
-	Handler   Handler
-	Queue     *Queue
-	Instance  string // 实例 ID，用于租约持有
-	Logger    *log.Logger
+	Store    *store.MemoryStore
+	Leases   *lease.Manager
+	Handler  Handler
+	Queue    *Queue
+	Instance string // 实例 ID，用于租约持有
+	Logger   *log.Logger
+	// effect 非空时启用持久化生效台账（exactly-once）；
+	// 为 nil 时保持旧版“Handler 幂等 + 状态比对”行为。
+	effect *EffectConfig
+	// keyLocks 串行化同实例对同一 key 的协调。
+	keyLocks *keyLock
 }
 
 // NewController 创建控制器。
@@ -117,45 +122,97 @@ func NewController(instance string, st *store.MemoryStore, lm *lease.Manager, h 
 		Queue:    NewQueue(),
 		Instance: instance,
 		Logger:   logger,
+		keyLocks: newKeyLock(),
 	}
 }
 
+// WithEffect 启用持久化生效台账：外部副作用按 effectID 全局去重，
+// 并携带租约 epoch 做 fencing。必须在 Run/ReconcileOne 之前配置。
+func (c *Controller) WithEffect(cfg EffectConfig) *Controller {
+	if cfg.Fingerprint == nil {
+		cfg.Fingerprint = DefaultFingerprint
+	}
+	c.effect = &cfg
+	return c
+}
+
+// ReconcileResult 描述一次协调的判定，便于调用方/测试断言
+// “这次到底算不算数、依据是什么”。
+type ReconcileResult struct {
+	Outcome  Outcome
+	Requeue  bool
+	EffectID string
+	Holder   string
+	Epoch    int64
+	RVBefore int64
+	RVAfter  int64
+	Attempts int
+	Detail   string
+}
+
 // ReconcileOne 对单个 key 执行一次协调，返回是否需要重试。
-// 流程：检查租约 -> 读取对象 -> 调用 Handler -> 乐观并发回写。
-// 幂等保证：Handler 返回的期望状态与当前状态一致时不写回，
-// 重复投递/重放不会产生新的版本或重复副作用。
+// 启用生效台账后走带 fencing 的 exactly-once 流程（见 reconcileEffect）；
+// 未启用时保持旧版行为（见 reconcileLegacy）。
 func (c *Controller) ReconcileOne(ctx context.Context, shard, key string) (requeue bool, err error) {
+	res, err := c.ReconcileDetailed(ctx, shard, key)
+	if err != nil {
+		return true, err
+	}
+	return res.Requeue, nil
+}
+
+// ReconcileDetailed 执行一次协调并返回结构化判定结果。
+func (c *Controller) ReconcileDetailed(ctx context.Context, shard, key string) (*ReconcileResult, error) {
+	if c.effect != nil && c.effect.Ledger != nil {
+		return c.reconcileEffect(ctx, shard, key)
+	}
+	return c.reconcileLegacy(ctx, shard, key)
+}
+
+// reconcileLegacy 旧版协调流程：Handler 幂等 + 期望状态比对 + 乐观写回。
+func (c *Controller) reconcileLegacy(ctx context.Context, shard, key string) (*ReconcileResult, error) {
+	res := &ReconcileResult{Outcome: OutcomeLegacy, Holder: c.Instance}
 	// 1. 租约检查：未持有则尝试获取/接管；被他人持有则稍后重试。
 	if !c.Leases.HeldBy(shard, c.Instance) {
 		rec, aerr := c.Leases.Acquire(shard, c.Instance)
 		if aerr != nil {
 			c.logf("key=%s shard=%s 判定=租约被他人持有 依据=%v -> 稍后重试", key, shard, aerr)
-			return true, nil
+			res.Requeue = true
+			res.Outcome = OutcomeRequeued
+			res.Detail = aerr.Error()
+			return res, nil
 		}
-		c.logf("key=%s shard=%s 判定=获得租约 holder=%s leaseVersion=%d expiresAt=%s",
-			key, shard, rec.Holder, rec.Version, rec.ExpiresAt.Format("15:04:05.000"))
+		c.logf("key=%s shard=%s 判定=获得租约 holder=%s leaseVersion=%d epoch=%d expiresAt=%s",
+			key, shard, rec.Holder, rec.Version, rec.Epoch, rec.ExpiresAt.Format("15:04:05.000"))
+		res.Epoch = rec.Epoch
 	}
 
 	// 2. 读取对象当前版本。
 	obj, err := c.Store.Get(key)
 	if err != nil {
-		return false, err
+		res.Requeue = true
+		res.Detail = err.Error()
+		return res, err
 	}
 	if obj == nil {
 		c.logf("key=%s shard=%s 判定=对象已删除 -> 无需协调", key, shard)
-		return false, nil
+		res.Outcome = OutcomeNoObject
+		return res, nil
 	}
+	res.RVBefore = obj.ResourceVersion
 	c.logf("key=%s shard=%s 读取 rv=%d gen=%d", key, shard, obj.ResourceVersion, obj.Generation)
 
 	// 3. 调用业务 Handler 计算期望状态。
 	desired, herr := c.Handler.Reconcile(ctx, obj)
 	if herr != nil {
 		c.logf("key=%s shard=%s rv=%d 判定=Handler失败 依据=%v -> 重试", key, shard, obj.ResourceVersion, herr)
-		return true, herr
+		res.Requeue = true
+		res.Detail = herr.Error()
+		return res, herr
 	}
 	if desired == nil || equalMap(desired, obj.Status) {
 		c.logf("key=%s shard=%s rv=%d 判定=已达目标状态 -> 幂等跳过写回", key, shard, obj.ResourceVersion)
-		return false, nil
+		return res, nil
 	}
 
 	// 4. 乐观并发回写：携带读取时的 rv，冲突则重读重试，不丢更新。
@@ -164,12 +221,18 @@ func (c *Controller) ReconcileOne(ctx context.Context, shard, key string) (reque
 	if uerr != nil {
 		if reason, ok := store.IsConflict(uerr); ok {
 			c.logf("key=%s shard=%s rv=%d 判定=写回冲突 原因=%s -> 重读重试", key, shard, obj.ResourceVersion, reason)
-			return true, nil
+			res.Requeue = true
+			res.Outcome = OutcomeRequeued
+			res.Detail = string(reason)
+			return res, nil
 		}
-		return true, uerr
+		res.Requeue = true
+		res.Detail = uerr.Error()
+		return res, uerr
 	}
+	res.RVAfter = updated.ResourceVersion
 	c.logf("key=%s shard=%s 判定=写回成功 rv=%d->%d", key, shard, obj.ResourceVersion, updated.ResourceVersion)
-	return false, nil
+	return res, nil
 }
 
 // Run 启动协调循环，直到 ctx 取消或队列关闭。

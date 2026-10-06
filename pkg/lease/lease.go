@@ -15,8 +15,12 @@ type Record struct {
 	Shard     string
 	Holder    string
 	ExpiresAt time.Time
-	// Version 用于租约记录自身的乐观并发控制。
+	// Version 用于租约记录自身的乐观并发控制，每次获取/续租都 +1。
 	Version int64
+	// Epoch 是领导世代（fencing token）：仅在持有者发生更换（接管）时 +1，
+	// 持有者本人续租保持不变。协调生效动作必须携带获取租约时的 Epoch，
+	// 落地前用 FenceOK 校验；换主后旧 Epoch 永久失效，旧实例的迟到动作据此判废。
+	Epoch int64
 }
 
 // Clock 抽象时间来源，便于测试。
@@ -75,8 +79,9 @@ func (m *Manager) SetClock(c Clock) {
 // 成功返回当前租约记录；被他人持有且未过期返回 ErrHeldByOther。
 // 规则：
 //   - 无租约或租约已过期：任何实例可获取/接管；
-//   - 持有者本人：续租，延长过期时间；
-//   - 他人持有且未过期：拒绝，防止双主。
+//   - 持有者本人：续租，延长过期时间，Version+1，Epoch 不变；
+//   - 他人持有且未过期：拒绝，防止双主；
+//   - 接管（含无记录后的新获取）：Version+1，Epoch+1。
 func (m *Manager) Acquire(shard, holder string) (*Record, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -92,12 +97,34 @@ func (m *Manager) Acquire(shard, holder string) (*Record, error) {
 	}
 	if ok {
 		rec.Version = cur.Version + 1
+		// 仅持有者更换才推进 Epoch：
+		// 续租（本人）或过期接管（前任已失效）在此区分。
+		if cur.Holder == holder {
+			rec.Epoch = cur.Epoch
+		} else {
+			rec.Epoch = cur.Epoch + 1
+		}
 	} else {
 		rec.Version = 1
+		rec.Epoch = 1
 	}
 	m.leases[shard] = rec
 	cp := *rec
 	return &cp, nil
+}
+
+// FenceOK 判定一个携带 (holder, epoch) 的生效动作此刻是否仍然算数。
+// 只有当前租约「由该 holder 持有、世代等于 epoch、且未过期」时才放行；
+// 换主后当前 holder 或 epoch 任一不匹配即拒绝，租约过期同样拒绝。
+// 这是旧实例迟到动作的过期判据，在外部副作用落地前后都应调用。
+func (m *Manager) FenceOK(shard, holder string, epoch int64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.leases[shard]
+	if !ok || cur.Holder != holder || cur.Epoch != epoch {
+		return false
+	}
+	return m.clock.Now().Before(cur.ExpiresAt)
 }
 
 // HeldBy 判断分片当前是否由 holder 有效持有。
